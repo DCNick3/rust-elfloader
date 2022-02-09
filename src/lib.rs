@@ -15,7 +15,6 @@ use bitflags::bitflags;
 use log::*;
 use xmas_elf::dynamic::*;
 use xmas_elf::header;
-use xmas_elf::program::ProgramHeader::Ph64;
 use xmas_elf::program::{ProgramIter, SegmentData, Type};
 use xmas_elf::sections::SectionData;
 use xmas_elf::*;
@@ -265,13 +264,11 @@ impl<'s> ElfBinary<'s> {
 
         // Parse relevant parts out of the the .dynamic section
         let mut dynamic = None;
-        for p in file.program_iter() {
-            if let Ph64(header) = p {
-                let typ = header.get_type()?;
-                if typ == Type::Dynamic {
-                    dynamic = ElfBinary::parse_dynamic(&file, header)?;
-                    break;
-                }
+        for header in file.program_iter() {
+            let typ = header.get_type()?;
+            if typ == Type::Dynamic {
+                dynamic = ElfBinary::parse_dynamic(&file, &header)?;
+                break;
             }
         }
 
@@ -337,7 +334,9 @@ impl<'s> ElfBinary<'s> {
         let header = self.file.header;
         let typ = header.pt2.type_().as_type();
 
-        if header.pt1.class() != header::Class::SixtyFour {
+        if header.pt1.class() != header::Class::SixtyFour
+            && header.pt1.class() != header::Class::ThirtyTwo
+        {
             Err(ElfLoaderErr::UnsupportedElfFormat)
         } else if header.pt1.version() != header::Version::Current {
             Err(ElfLoaderErr::UnsupportedElfVersion)
@@ -388,7 +387,7 @@ impl<'s> ElfBinary<'s> {
     /// A human readable version of the dynamic section is best obtained with `readelf -d <binary>`.
     fn parse_dynamic(
         file: &ElfFile,
-        dynamic_header: &ProgramHeader64,
+        dynamic_header: &ProgramHeader,
     ) -> Result<Option<DynamicInfo>, ElfLoaderErr> {
         trace!("load dynamic segement {:?}", dynamic_header);
 
@@ -408,6 +407,21 @@ impl<'s> ElfBinary<'s> {
                         Tag::Flags1 => {
                             flags1 =
                                 unsafe { DynamicFlags1::from_bits_unchecked(dyn_entry.get_val()?) };
+                        }
+                        _ => trace!("unsupported {:?}", dyn_entry),
+                    }
+                }
+            }
+            SegmentData::Dynamic32(dyn_entries) => {
+                for dyn_entry in dyn_entries {
+                    let tag = dyn_entry.get_tag()?;
+                    match tag {
+                        Tag::Rela => rela = dyn_entry.get_ptr()?.into(),
+                        Tag::RelaSize => rela_size = dyn_entry.get_val()?.into(),
+                        Tag::Flags1 => {
+                            flags1 = unsafe {
+                                DynamicFlags1::from_bits_unchecked(dyn_entry.get_val()?.into())
+                            };
                         }
                         _ => trace!("unsupported {:?}", dyn_entry),
                     }
@@ -442,23 +456,19 @@ impl<'s> ElfBinary<'s> {
         loader.allocate(self.iter_loadable_headers())?;
 
         // Load all headers
-        for p in self.file.program_iter() {
-            if let Ph64(header) = p {
-                let typ = header.get_type()?;
-                if typ == Type::Load {
-                    loader.load(
-                        header.flags,
-                        header.virtual_addr,
-                        header.raw_data(&self.file),
-                    )?;
-                } else if typ == Type::Tls {
-                    loader.tls(
-                        header.virtual_addr,
-                        header.file_size,
-                        header.mem_size,
-                        header.align,
-                    )?;
+        for header in self.file.program_iter() {
+            let typ = header.get_type()?;
+            if typ == Type::Load {
+                if let SegmentData::Undefined(data) = header.get_data(&self.file)? {
+                    loader.load(header.flags(), header.virtual_addr(), data)?;
                 }
+            } else if typ == Type::Tls {
+                loader.tls(
+                    header.virtual_addr(),
+                    header.file_size(),
+                    header.mem_size(),
+                    header.align(),
+                )?;
             }
         }
 
@@ -466,12 +476,10 @@ impl<'s> ElfBinary<'s> {
         self.maybe_relocate(loader)?;
 
         // Process .data.rel.ro
-        for p in self.file.program_iter() {
-            if let Ph64(header) = p {
-                let typ = header.get_type()?;
-                if typ == Type::GnuRelro {
-                    loader.make_readonly(header.virtual_addr, header.mem_size as usize)?;
-                }
+        for header in self.file.program_iter() {
+            let typ = header.get_type()?;
+            if typ == Type::GnuRelro {
+                loader.make_readonly(header.virtual_addr(), header.mem_size() as usize)?;
             }
         }
 
@@ -481,14 +489,10 @@ impl<'s> ElfBinary<'s> {
     fn iter_loadable_headers(&self) -> LoadableHeaders {
         // Trying to determine loadeable headers
         fn select_load(pheader: &ProgramHeader) -> bool {
-            if let Ph64(header) = pheader {
-                header
-                    .get_type()
-                    .map(|typ| typ == Type::Load)
-                    .unwrap_or(false)
-            } else {
-                false
-            }
+            pheader
+                .get_type()
+                .map(|typ| typ == Type::Load)
+                .unwrap_or(false)
         }
 
         // Create an iterator (well filter really) that has all loadeable
